@@ -1,0 +1,6 @@
+player.py
+player_ffmpeg.py
+.vscode
+.websocket-player-venv
+.gitignore
+LICENSE

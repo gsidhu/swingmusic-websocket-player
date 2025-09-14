@@ -1,178 +1,23 @@
+"""
+This script encapsulates the VLCPlayer singleton class. It manages the core VLC
+player instance, audio playback controls (play, pause, stop, seek, volume),
+queue management, and the overall state of the media player. It also includes
+methods for starting and stopping HLS streams for specific clients by interacting
+with HLSStreamManager instances.
+"""
+
 import asyncio
-import logging
-import os
-import shutil
 import time
 import uuid
 from pathlib import Path
 from typing import List, Optional
 
-import psutil
 import vlc
-from aiohttp import web # Import aiohttp web
-from starlette.applications import Starlette
-from starlette.routing import WebSocketRoute
-from starlette.websockets import WebSocket, WebSocketDisconnect
-
-# Configuration
-LOG_LEVEL = logging.INFO
-HLS_HTTP_PORT = 8000 # Port for the HLS HTTP server
-
-#  Logging Setup
-logging.basicConfig(
-    level=LOG_LEVEL, format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-HLS_TEMP_DIR = Path("/tmp/hls_streams")
-HLS_TEMP_DIR.mkdir(exist_ok=True)
-
-class HLSStreamManager:
-    """
-    Manages the lifecycle of a single HLS stream for a client.
-    Handles FFmpeg process, temporary directory, and HLS file serving.
-    """
-    def __init__(self, client_id: str, input_path: Path, http_port: int = 8000):
-        self.client_id = client_id
-        self.input_path = input_path
-        self.http_port = http_port
-        self.stream_id = str(uuid.uuid4())
-        self.temp_dir = HLS_TEMP_DIR / self.stream_id
-        self.temp_dir.mkdir(parents=True, exist_ok=True)
-        self.ffmpeg_process: Optional[asyncio.subprocess.Process] = None
-        self._monitor_task: Optional[asyncio.Task] = None
-        logger.info(f"HLSStreamManager initialized for client {client_id}, stream {self.stream_id}")
-
-    async def start_stream(self):
-        """Constructs and launches the FFmpeg process for HLS streaming."""
-        playlist_path = self.temp_dir / f"{self.stream_id}.m3u8"
-        segment_path = self.temp_dir / f"{self.stream_id}_%03d.ts"
-
-        # FFmpeg command for HLS generation
-        # -nostdin: Prevents FFmpeg from waiting for input on stdin
-        # -re: Read input at native frame rate
-        # -i "{input_path}": Input file
-        # -c:v copy: Copy video codec (no re-encoding)
-        # -c:a aac -b:a 192k: Encode audio to AAC at 192kbps
-        # -hls_time 4: Segment duration of 4 seconds
-        # -hls_list_size 5: Keep 5 segments in the playlist
-        # -hls_flags delete_segments+independent_segments: Delete old segments, ensure segments are independent
-        # -y: Overwrite output files without asking
-        # -hls_segment_filename "{segment_path}": Pattern for segment filenames
-        # "{playlist_path}": Output playlist filename
-        ffmpeg_command = [
-            "ffmpeg",
-            "-nostdin",
-            "-re",
-            "-i", str(self.input_path),
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-hls_time", "4",
-            "-hls_list_size", "5",
-            "-hls_flags", "delete_segments+independent_segments",
-            "-y",
-            "-hls_segment_filename", str(segment_path),
-            str(playlist_path)
-        ]
-
-        logger.info(f"Starting FFmpeg for client {self.client_id}: {' '.join(ffmpeg_command)}")
-        try:
-            self.ffmpeg_process = await asyncio.create_subprocess_exec(
-                *ffmpeg_command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            self._monitor_task = asyncio.create_task(self._monitor_ffmpeg_process())
-            logger.info(f"FFmpeg process started with PID {self.ffmpeg_process.pid}")
-        except FileNotFoundError:
-            logger.error("FFmpeg not found. Please ensure FFmpeg is installed and in your PATH.")
-            self.ffmpeg_process = None
-        except Exception as e:
-            logger.error(f"Error starting FFmpeg process: {e}", exc_info=True)
-            self.ffmpeg_process = None
-
-    async def _monitor_ffmpeg_process(self):
-        """Monitors the FFmpeg process and logs its output/errors."""
-        if not self.ffmpeg_process:
-            return
-
-        while self.ffmpeg_process and self.ffmpeg_process.returncode is None:
-            try:
-                stdout_line = b""
-                stderr_line = b""
-
-                if self.ffmpeg_process.stdout:
-                    stdout_line = await self.ffmpeg_process.stdout.readline()
-                if self.ffmpeg_process.stderr:
-                    stderr_line = await self.ffmpeg_process.stderr.readline()
-
-                if stdout_line:
-                    logger.debug(f"FFmpeg stdout ({self.client_id}): {stdout_line.decode().strip()}")
-                if stderr_line:
-                    logger.debug(f"FFmpeg stderr ({self.client_id}): {stderr_line.decode().strip()}")
-
-                await asyncio.sleep(1) # Check every second
-            except asyncio.CancelledError:
-                logger.info(f"FFmpeg monitor task cancelled for client {self.client_id}.")
-                break
-            except Exception as e:
-                logger.error(f"Error monitoring FFmpeg process for client {self.client_id}: {e}", exc_info=True)
-                break
-
-        if self.ffmpeg_process and self.ffmpeg_process.returncode is not None:
-            logger.warning(f"FFmpeg process for client {self.client_id} exited with code {self.ffmpeg_process.returncode}")
-            if self.ffmpeg_process.returncode != 0:
-                if self.ffmpeg_process.stderr:
-                    stderr_output = (await self.ffmpeg_process.stderr.read()).decode()
-                    logger.error(f"FFmpeg error output for client {self.client_id}:\n{stderr_output}")
-        
-        # Ensure cleanup if process exits unexpectedly
-        await self.stop_stream()
-
-
-    async def stop_stream(self):
-        """Terminates the FFmpeg process and cleans up temporary files."""
-        if self._monitor_task:
-            self._monitor_task.cancel()
-            await asyncio.gather(self._monitor_task, return_exceptions=True) # Wait for cancellation
-
-        if self.ffmpeg_process and self.ffmpeg_process.returncode is None:
-            logger.info(f"Terminating FFmpeg process {self.ffmpeg_process.pid} for client {self.client_id}.")
-            try:
-                # Use psutil to kill the process tree
-                process = psutil.Process(self.ffmpeg_process.pid)
-                for proc in process.children(recursive=True):
-                    proc.kill()
-                process.kill()
-                await self.ffmpeg_process.wait() # Wait for the process to actually terminate
-                logger.info(f"FFmpeg process {self.ffmpeg_process.pid} terminated.")
-            except psutil.NoSuchProcess:
-                logger.warning(f"FFmpeg process {self.ffmpeg_process.pid} already gone.")
-            except Exception as e:
-                logger.error(f"Error terminating FFmpeg process {self.ffmpeg_process.pid}: {e}", exc_info=True)
-        
-        if self.temp_dir.exists():
-            logger.info(f"Cleaning up temporary HLS directory: {self.temp_dir}")
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
-        
-        self.ffmpeg_process = None
-        logger.info(f"HLS stream stopped and cleaned up for client {self.client_id}.")
-
-    def get_playlist_url(self) -> str:
-        """Returns the URL for the HLS playlist."""
-        return f"http://localhost:{self.http_port}/{self.client_id}/{self.stream_id}.m3u8"
-
-class ClientSession:
-    """
-    Represents a single connected WebSocket client and its associated state,
-    including an optional HLSStreamManager.
-    """
-    def __init__(self, client_id: str, websocket: WebSocket):
-        self.client_id = client_id
-        self.websocket = websocket
-        self.hls_manager: Optional[HLSStreamManager] = None
-        logger.info(f"ClientSession created for client ID: {client_id}")
+import psutil # Added for process killing in HLS stream management
+from logger_setup import logger
+from client_session import ClientSession
+from hls_manager import HLSStreamManager
+from config import HLS_HTTP_PORT
 
 class VLCPlayer:
     """
@@ -193,7 +38,7 @@ class VLCPlayer:
         self.connected_clients: dict[str, ClientSession] # Changed to dict for client_id mapping
         self._status_broadcaster_task: asyncio.Task | None
         self.keep_alive: bool
-        self.hls_http_port: int = 8000 # Default HLS HTTP server port
+        self.hls_http_port: int = HLS_HTTP_PORT # Default HLS HTTP server port
         
         # Queue management
         self.queue: List[str] = []
@@ -421,7 +266,7 @@ class VLCPlayer:
             }
         return await self._run_sync(_get_status_sync)
     
-    async def register_client(self, websocket: WebSocket):
+    async def register_client(self, websocket): # Type hint for websocket will be added in websocket_handler
         """
         Registers a new client. A unique client ID is generated and a ClientSession is created.
         """
@@ -553,176 +398,3 @@ class VLCPlayer:
         if not self._track_end_listener_task or self._track_end_listener_task.done():
             logger.info("Starting track end listener task.")
             self._track_end_listener_task = asyncio.create_task(self._track_end_listener())
-
-# Starlette WebSocket Endpoint
-player = VLCPlayer()
-
-async def player_websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    client_id = await player.register_client(websocket) # Get the client_id after registration
-    
-    try:
-        # Send initial status immediately on connection
-        initial_status = await player.get_status()
-        await websocket.send_json({"type": "status_update", "data": initial_status})
-
-        while True:
-            message = await websocket.receive_json()
-            command = message.get("command")
-            payload = message.get("payload", {})
-
-            logger.debug(f"Received command: {command} from client {client_id} with payload: {payload}")
-            
-            # HLS-specific commands
-            if command == "start_hls":
-                playlist_url = await player.start_hls_for_client(client_id)
-                if playlist_url:
-                    await websocket.send_json({"type": "hls_started", "data": {"playlist_url": playlist_url}})
-                else:
-                    await websocket.send_json({"type": "error", "data": {"message": "Failed to start HLS stream."}})
-            elif command == "stop_hls":
-                await player.stop_hls_for_client(client_id)
-                await websocket.send_json({"type": "hls_stopped", "data": {"message": "HLS stream stopped."}})
-            # Existing commands
-
-            if command == "play":
-                filepath = payload.get("filepath")
-                if filepath:
-                    play_immediately = payload.get("play_immediately", True)
-                    await player.play_new(filepath, play_immediately=play_immediately)
-                else:
-                    await player.resume()
-            elif command == "pause":
-                await player.pause()
-            elif command == "stop":
-                await player.stop()
-            elif command == "seek":
-                await player.seek(int(payload.get("position_ms", 0)))
-            elif command == "set_volume":
-                await player.set_volume(int(payload.get("level", 100)))
-            elif command == "set_keep_alive":
-                enabled = payload.get("enabled", False)
-                player.set_keep_alive(enabled)
-                # Acknowledge the change by sending back the current status.
-                # This will be broadcast to all clients, which is the desired behavior.
-            elif command == "set_queue":
-                filepaths = payload.get("filepaths", [])
-                start_index = payload.get("startIndex", 0)
-                tracklist_data = payload.get("tracklistData") # Extract the full tracklist object
-                player.set_queue(filepaths, start_index, tracklist_data)
-                player.auto_advance = True  # Enable auto-advance when queue is set
-                # Optionally start playing the current track immediately
-                if filepaths and payload.get("play_immediately", True):
-                    await player.jump_to_queue_index(start_index)
-            elif command == "queue_next":
-                await player.play_next_in_queue()
-            elif command == "queue_previous":
-                await player.play_previous_in_queue()
-            elif command == "queue_jump":
-                index = payload.get("index", 0)
-                await player.jump_to_queue_index(index)
-            elif command == "get_status":
-                current_status = await player.get_status()
-                await websocket.send_json({"type": "status_update", "data": current_status})
-            elif command == "ping":
-                # pong is handled implicitly by status updates, but we can be explicit
-                await websocket.send_json({"type": "pong"})
-            elif command == "get_connections_count":
-                count = player.get_active_connections_count()
-                await websocket.send_json({"type": "connections_count", "data": {"count": count}})
-            elif command == "kill_and_reset":
-                await player.kill_all_connections_and_reset()
-                # Cannot call "send" once a close message has been sent.
-                # await websocket.send_json({"type": "server_reset", "data": {"message": "Server reset complete."}})
-            else:
-                await websocket.send_json({
-                    "type": "error", 
-                    "data": {"message": f"Unknown command: {command}"}
-                })
-
-    except WebSocketDisconnect:
-        logger.info("WebSocket disconnected.")
-    except Exception as e:
-        logger.error(f"An error occurred in the WebSocket handler for client {client_id}: {e}", exc_info=True)
-    finally:
-        await player.unregister_client(client_id)
-
-async def on_startup():
-    player.start_status_broadcaster()
-
-routes = [
-    WebSocketRoute("/ws/player", endpoint=player_websocket_endpoint),
-]
-
-app = Starlette(routes=routes, on_startup=[on_startup])
-
-async def hls_file_server_handler(request):
-    """
-    Handles requests for HLS playlist (.m3u8) and segment (.ts) files.
-    """
-    client_id = request.match_info.get('client_id')
-    filename = request.match_info.get('filename')
-    
-    if not client_id or not filename:
-        raise web.HTTPNotFound()
-
-    # Prevent directory traversal
-    if ".." in filename or "/" in filename or "\\" in filename:
-        raise web.HTTPForbidden()
-
-    # Find the HLSStreamManager for the client
-    client_session = player.connected_clients.get(client_id)
-    if not client_session or not client_session.hls_manager:
-        logger.warning(f"Request for HLS file for non-existent or non-streaming client: {client_id}")
-        raise web.HTTPNotFound()
-
-    file_path = client_session.hls_manager.temp_dir / filename
-
-    if not file_path.is_file():
-        logger.warning(f"HLS file not found: {file_path}")
-        raise web.HTTPNotFound()
-
-    logger.debug(f"Serving HLS file: {file_path}")
-    response = web.FileResponse(file_path)
-    response.headers['Access-Control-Allow-Origin'] = '*' # CORS for browser compatibility
-    response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Origin, X-Requested-With, Content-Type, Accept'
-    
-    if filename.endswith(".m3u8"):
-        response.headers['Content-Type'] = 'application/x-mpegURL'
-    elif filename.endswith(".ts"):
-        response.headers['Content-Type'] = 'video/MP2T'
-    
-    return response
-
-async def start_hls_http_server(host: str, port: int):
-    """Starts the aiohttp HTTP server for serving HLS files."""
-    hls_app = web.Application()
-    hls_app.router.add_get("/{client_id}/{filename}", hls_file_server_handler)
-    
-    runner = web.AppRunner(hls_app)
-    await runner.setup()
-    site = web.TCPSite(runner, host, port)
-    logger.info(f"Starting HLS HTTP server on http://{host}:{port}")
-    await site.start()
-    return runner # Return runner to keep it alive
-
-async def run_servers():
-    """Runs both the Starlette WebSocket server and the aiohttp HLS HTTP server concurrently."""
-    # Set the HLS HTTP port in the VLCPlayer instance
-    player.hls_http_port = HLS_HTTP_PORT
-
-    # Start the Starlette server
-    config = uvicorn.Config(app, host="0.0.0.0", port=1971, log_level="info")
-    starlette_server = uvicorn.Server(config)
-    starlette_task = asyncio.create_task(starlette_server.serve())
-
-    # Start the aiohttp HLS HTTP server
-    hls_server_runner = await start_hls_http_server("0.0.0.0", HLS_HTTP_PORT)
-    
-    # Keep servers running indefinitely
-    await asyncio.gather(starlette_task, asyncio.Future()) # asyncio.Future() to keep the aiohttp server running
-
-if __name__ == "__main__":
-    import uvicorn
-    asyncio.run(run_servers())
