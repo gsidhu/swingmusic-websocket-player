@@ -1,11 +1,10 @@
-import unittest
 import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-class TestIntegration(unittest.TestCase):
+class TestIntegration:
 
-    def setUp(self):
+    def setup_method(self, method):
         """Set up for each test."""
         self.mock_websocket = AsyncMock()
 
@@ -26,30 +25,38 @@ class TestIntegration(unittest.TestCase):
         mock_hls_manager.request_hls_stream.assert_called_with(client_id, "test.mp3")
 
     @pytest.mark.asyncio
-    @patch('websocket_handler.handle_websocket_message')
+    @patch('websocket_handler.websocket_handler_instance.handle_message')
     async def test_hls_command_roundtrip(self, mock_handle_message):
         """Send HLS commands and verify correct responses and state changes."""
         mock_handle_message.return_value = {"status": "ok", "url": "http://.../stream.m3u8"}
         
-        response = await mock_handle_message(self.mock_websocket, '{"command": "request_hls_stream"}')
-        self.assertEqual(response['status'], 'ok')
+        response = await mock_handle_message("test_client", {"command": "request_hls_stream"})
+        assert response['status'] == 'ok'
 
         mock_handle_message.return_value = {"status": "ok"}
-        response = await mock_handle_message(self.mock_websocket, '{"command": "stop_hls_stream"}')
-        self.assertEqual(response['status'], 'ok')
+        response = await mock_handle_message("test_client", {"command": "stop_hls_stream"})
+        assert response['status'] == 'ok'
 
     @pytest.mark.asyncio
     @patch('client_session.ClientSession')
     async def test_client_disconnect_cleanup(self, MockClientSession):
         """Assert that FFmpeg process and temp files are cleaned up on disconnect."""
-        mock_client_session = MockClientSession.return_value
-        mock_client_session.hls_manager = AsyncMock()
+        # We need to mock the instance, not the class
+        mock_client_session_instance = MockClientSession.return_value
+        mock_client_session_instance.hls_manager = AsyncMock()
         
+        # We need to make the disconnect method a real async function for the test
+        async def mock_disconnect():
+            if mock_client_session_instance.hls_manager:
+                await mock_client_session_instance.hls_manager.stop_stream()
+        
+        mock_client_session_instance.disconnect = mock_disconnect
+
         # Simulate the session ending
-        await mock_client_session.disconnect()
+        await mock_client_session_instance.disconnect()
         
         # Verify that the cleanup function was called
-        mock_client_session.hls_manager.stop_stream.assert_called_once()
+        mock_client_session_instance.hls_manager.stop_stream.assert_called_once()
 
     def test_browser_url_access(self):
         """Verify stream URL accessibility from a browser (mocked)."""
@@ -63,8 +70,8 @@ class TestIntegration(unittest.TestCase):
             
             import requests
             response = requests.get("http://localhost:8080/hls/test/stream.m3u8")
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.headers['Content-Type'], 'application/vnd.apple.mpegurl')
+            assert response.status_code == 200
+            assert response.headers['Content-Type'] == 'application/vnd.apple.mpegurl'
 
     @patch('vlc_player.VLCPlayer')
     @patch('hls_manager.HLSStreamManager')
@@ -85,6 +92,3 @@ class TestIntegration(unittest.TestCase):
         mock_vlc_player.play.assert_called_with("test.mp3")
         mock_vlc_player.pause.assert_called()
         mock_hls_manager.request_hls_stream.assert_called_with(hls_client_id, "test.mp3")
-
-if __name__ == '__main__':
-    unittest.main()

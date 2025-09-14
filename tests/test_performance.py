@@ -1,13 +1,12 @@
-import unittest
 import asyncio
 import time
 import psutil
 import pytest
 from unittest.mock import patch, MagicMock
 
-class TestPerformance(unittest.TestCase):
+class TestPerformance:
 
-    def setUp(self):
+    def setup_method(self, method):
         """Set up for each test."""
         pass
 
@@ -33,8 +32,8 @@ class TestPerformance(unittest.TestCase):
         print(f"Memory Usage during test: {(mem_after - mem_before) / 1024 / 1024} MB")
 
         # These are example thresholds and should be adjusted
-        self.assertLess(cpu_after - cpu_before, 50.0)
-        self.assertLess(mem_after - mem_before, 100 * 1024 * 1024) # 100 MB
+        assert cpu_after - cpu_before < 50.0
+        assert mem_after - mem_before < 100 * 1024 * 1024 # 100 MB
 
     @pytest.mark.asyncio
     @patch('hls_manager.HLSStreamManager')
@@ -57,7 +56,7 @@ class TestPerformance(unittest.TestCase):
         latency = end_time - start_time
         print(f"Stream generation latency: {latency:.4f} seconds")
         
-        self.assertLess(latency, 5.0) # Assert latency is under 5 seconds
+        assert latency < 5.0 # Assert latency is under 5 seconds
 
     def test_network_bandwidth(self):
         """Monitor network traffic to assert it aligns with HLS bitrate."""
@@ -77,7 +76,7 @@ class TestPerformance(unittest.TestCase):
         
         print(f"Average network bandwidth: {bandwidth_mbps:.2f} Mbps")
         # We can't assert a specific value without a real stream.
-        self.assertGreaterEqual(bandwidth_mbps, 0)
+        assert bandwidth_mbps >= 0
 
     @patch('hls_manager.HLSStreamManager')
     def test_system_stability_single_hls(self, MockHLSStreamManager):
@@ -97,7 +96,4 @@ class TestPerformance(unittest.TestCase):
             time.sleep(1)
             
         # If the test completes without crashing, it's a pass.
-        self.assertTrue(True)
-
-if __name__ == '__main__':
-    unittest.main()
+        assert True
