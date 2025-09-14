@@ -1,3 +1,6 @@
 .vscode
 .websocket-player-venv
 .DS_Store
+*.mp3
+__pycache__
+*temp*/

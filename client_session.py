@@ -30,3 +30,9 @@ class ClientSession:
         self.metadata = metadata if metadata is not None else {}
         self.hls_manager: Optional[HLSStreamManager] = None
         logger.info(f"ClientSession created for client ID: {client_id}, Type: {client_type.value}")
+
+    async def disconnect(self):
+        """Clean up resources when a client disconnects."""
+        if self.hls_manager:
+            await self.hls_manager.stop_stream()
+        logger.info(f"ClientSession disconnected for client ID: {self.client_id}")
