@@ -1,6 +1,8 @@
+.git
 player.py
 player_ffmpeg.py
 .vscode
 .websocket-player-venv
 .gitignore
 LICENSE
+llm_sop.md

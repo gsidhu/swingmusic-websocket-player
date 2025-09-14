@@ -10,12 +10,13 @@ import asyncio
 import time
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 import vlc
 import psutil # Added for process killing in HLS stream management
+from starlette.websockets import WebSocket # Import WebSocket
 from logger_setup import logger
-from client_session import ClientSession
+from client_session import ClientSession, ClientType # Import ClientType
 from hls_manager import HLSStreamManager
 from config import HLS_HTTP_PORT
 
@@ -35,7 +36,8 @@ class VLCPlayer:
         self.vlc_instance: vlc.Instance
         self.player: vlc.MediaPlayer
         self.current_track_path: Path | None
-        self.connected_clients: dict[str, ClientSession] # Changed to dict for client_id mapping
+        self.active_clients: Dict[str, ClientSession] # Stores ClientSession instances
+        self.websocket_connections: Dict[str, WebSocket] # Stores raw WebSocket connections
         self._status_broadcaster_task: asyncio.Task | None
         self.keep_alive: bool
         self.hls_http_port: int = HLS_HTTP_PORT # Default HLS HTTP server port
@@ -50,23 +52,32 @@ class VLCPlayer:
         if hasattr(self, 'player'):
             return
 
-        logger.info("Initializing VLC Player...")
+        logger.info("Initializing VLC Player (acting as ClientManager)...")
         self.vlc_instance = vlc.Instance("--no-xlib") # type: ignore
         self.player = self.vlc_instance.media_player_new()
         self.current_track_path = None
         
-        self.connected_clients = {} # Initialize as an empty dictionary
+        self.active_clients = {} # Initialize as an empty dictionary for ClientSession objects
+        self.websocket_connections = {} # Initialize as an empty dictionary for WebSocket objects
         self._status_broadcaster_task = None
         self.keep_alive = False
+
+    def get_client_session(self, client_id: str) -> Optional[ClientSession]:
+        """Retrieves a ClientSession object by its ID."""
+        return self.active_clients.get(client_id)
 
     async def start_hls_for_client(self, client_id: str) -> Optional[str]:
         """
         Starts an HLS stream for a specific client based on the currently playing track.
         Returns the playlist URL if successful, None otherwise.
         """
-        client_session = self.connected_clients.get(client_id)
+        client_session = self.get_client_session(client_id)
         if not client_session:
             logger.warning(f"Attempted to start HLS for unknown client: {client_id}")
+            return None
+        
+        if client_session.client_type != ClientType.HLS_STREAMING:
+            logger.warning(f"Client {client_id} is not an HLS_STREAMING client. Cannot start HLS.")
             return None
 
         if not self.current_track_path:
@@ -93,9 +104,13 @@ class VLCPlayer:
 
     async def stop_hls_for_client(self, client_id: str):
         """Stops the HLS stream for a specific client."""
-        client_session = self.connected_clients.get(client_id)
+        client_session = self.get_client_session(client_id)
         if not client_session:
             logger.warning(f"Attempted to stop HLS for unknown client: {client_id}")
+            return
+        
+        if client_session.client_type != ClientType.HLS_STREAMING:
+            logger.warning(f"Client {client_id} is not an HLS_STREAMING client. No HLS stream to stop.")
             return
 
         if client_session.hls_manager:
@@ -251,6 +266,30 @@ class VLCPlayer:
         self.keep_alive = bool(enabled)
         logger.info(f"Keep-alive has been {'ENABLED' if self.keep_alive else 'DISABLED'}.")
 
+    async def send_message_to_client(self, client_id: str, message: Dict[str, Any]):
+        """Sends a JSON message to a specific client."""
+        websocket = self.websocket_connections.get(client_id)
+        if websocket:
+            try:
+                await websocket.send_json(message)
+                logger.debug(f"Sent message to client {client_id}: {message.get('command', message.get('type'))}")
+            except Exception as e:
+                logger.error(f"Failed to send message to client {client_id}: {e}")
+        else:
+            logger.warning(f"Attempted to send message to unknown client: {client_id}")
+
+    async def broadcast_message_to_type(self, client_type: ClientType, message: Dict[str, Any]):
+        """Sends a JSON message to all clients of a specific type."""
+        tasks = []
+        for client_id, session in self.active_clients.items():
+            if session.client_type == client_type:
+                tasks.append(self.send_message_to_client(client_id, message))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info(f"Broadcasted message to {client_type.value} clients: {message.get('command', message.get('type'))}")
+        else:
+            logger.debug(f"No {client_type.value} clients to broadcast to.")
+
     async def get_status(self) -> dict:
         """Gets the current player status."""
         def _get_status_sync():
@@ -266,52 +305,66 @@ class VLCPlayer:
             }
         return await self._run_sync(_get_status_sync)
     
-    async def register_client(self, websocket): # Type hint for websocket will be added in websocket_handler
+    async def register_client(self, websocket: WebSocket, client_type_str: str, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """
-        Registers a new client. A unique client ID is generated and a ClientSession is created.
+        Registers a new client with a generated ID, client type, and metadata.
+        Returns the generated client_id if successful, None otherwise.
         """
+        try:
+            client_type = ClientType(client_type_str)
+        except ValueError:
+            logger.error(f"Invalid client type provided: {client_type_str}")
+            return None
+
         client_id = str(uuid.uuid4())
-        client_session = ClientSession(client_id, websocket)
-        self.connected_clients[client_id] = client_session
-        logger.info(f"Client {client_id} connected. Total clients: {len(self.connected_clients)}")
-        # Send the client their ID
-        await websocket.send_json({"type": "client_id", "data": {"client_id": client_id}})
+        client_session = ClientSession(client_id, websocket, client_type, metadata)
+        
+        self.active_clients[client_id] = client_session
+        self.websocket_connections[client_id] = websocket
+        
+        logger.info(f"Client {client_id} registered as {client_type.value}. Total active clients: {len(self.active_clients)}")
         return client_id
 
     async def unregister_client(self, client_id: str):
         """Removes a client and stops its HLS stream if active."""
-        client_session = self.connected_clients.pop(client_id, None)
+        client_session = self.active_clients.pop(client_id, None)
+        websocket = self.websocket_connections.pop(client_id, None)
+
         if client_session:
-            logger.info(f"Client {client_id} disconnected. Remaining clients: {len(self.connected_clients)}")
+            logger.info(f"Client {client_id} ({client_session.client_type.value}) disconnected. Remaining clients: {len(self.active_clients)}")
             if client_session.hls_manager:
                 await client_session.hls_manager.stop_stream()
         else:
             logger.warning(f"Attempted to unregister unknown client: {client_id}")
         
         # Check both client count and the keep_alive flag for VLC playback
-        if not self.connected_clients and not self.keep_alive:
+        if not self.active_clients and not self.keep_alive:
             logger.info("Last client has disconnected and keep-alive is OFF. Stopping VLC playback.")
             await self.stop()
-        elif not self.connected_clients and self.keep_alive:
+        elif not self.active_clients and self.keep_alive:
             logger.info("Last client has disconnected, but keep-alive is ON. Playback will continue.")
 
     def get_active_connections_count(self) -> int:
         """Returns the number of currently active WebSocket connections."""
-        return len(self.connected_clients)
+        return len(self.active_clients)
 
     async def kill_all_connections_and_reset(self):
         """Kills all active connections, clears the queue, and resets the server."""
         logger.info("Killing all connections, clearing queue, and resetting server.")
         
         # Close all active WebSocket connections and stop HLS streams
-        for client_id, client_session in list(self.connected_clients.items()):
+        for client_id, client_session in list(self.active_clients.items()):
             try:
                 if client_session.hls_manager:
                     await client_session.hls_manager.stop_stream()
-                await client_session.websocket.close()
+                # Use the stored websocket connection to close
+                websocket = self.websocket_connections.get(client_id)
+                if websocket:
+                    await websocket.close()
             except Exception as e:
                 logger.warning(f"Error closing client {client_id} connection during reset: {e}")
-        self.connected_clients.clear()
+        self.active_clients.clear()
+        self.websocket_connections.clear()
 
         # Clear the queue
         self.queue = []
@@ -342,7 +395,7 @@ class VLCPlayer:
         while True:
             try:
                 # Also process player state if keep_alive is true, even with no clients
-                is_active = self.connected_clients or self.keep_alive
+                is_active = self.active_clients or self.keep_alive
                 if not is_active:
                     await asyncio.sleep(1)
                     continue
@@ -350,14 +403,16 @@ class VLCPlayer:
                 status = await self.get_status()
                 
                 # Only try to send if there are actually clients connected
-                if self.connected_clients:
+                if self.active_clients:
                     # Create a list of send tasks to avoid issues if a client disconnects during iteration
                     tasks = []
-                    for client_session in self.connected_clients.values():
+                    for client_id, client_session in self.active_clients.items():
                         try:
-                            tasks.append(client_session.websocket.send_json({"type": "status_update", "data": status}))
+                            # Ensure the message includes the client_id for context
+                            message = {"type": "status_update", "data": status, "recipient_client_id": client_id}
+                            tasks.append(self.send_message_to_client(client_id, message))
                         except Exception as e:
-                            logger.warning(f"Error preparing status update for client {client_session.client_id}: {e}")
+                            logger.warning(f"Error preparing status update for client {client_id}: {e}")
                     await asyncio.gather(*tasks, return_exceptions=True) # Don't let one failed client stop others
             except Exception as e:
                 logger.warning(f"Error in status broadcaster: {e}")
