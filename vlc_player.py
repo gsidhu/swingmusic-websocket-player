@@ -14,11 +14,12 @@ from typing import List, Optional, Dict, Any
 
 import vlc
 import psutil # Added for process killing in HLS stream management
-from starlette.websockets import WebSocket # Import WebSocket
+from starlette.websockets import WebSocket
 from logger_setup import logger
-from client_session import ClientSession, ClientType # Import ClientType
+from client_session import ClientSession, ClientType
 from hls_manager import HLSStreamManager
 from config import HLS_HTTP_PORT
+from protocol import MESSAGE_TYPE_STATUS_UPDATE
 
 class VLCPlayer:
     """
@@ -36,11 +37,11 @@ class VLCPlayer:
         self.vlc_instance: vlc.Instance
         self.player: vlc.MediaPlayer
         self.current_track_path: Path | None
-        self.active_clients: Dict[str, ClientSession] # Stores ClientSession instances
-        self.websocket_connections: Dict[str, WebSocket] # Stores raw WebSocket connections
+        self.active_clients: Dict[str, ClientSession]
+        self.websocket_connections: Dict[str, WebSocket]
         self._status_broadcaster_task: asyncio.Task | None
         self.keep_alive: bool
-        self.hls_http_port: int = HLS_HTTP_PORT # Default HLS HTTP server port
+        self.hls_http_port: int = HLS_HTTP_PORT
         
         # Queue management
         self.queue: List[str] = []
@@ -57,8 +58,8 @@ class VLCPlayer:
         self.player = self.vlc_instance.media_player_new()
         self.current_track_path = None
         
-        self.active_clients = {} # Initialize as an empty dictionary for ClientSession objects
-        self.websocket_connections = {} # Initialize as an empty dictionary for WebSocket objects
+        self.active_clients = {} 
+        self.websocket_connections = {}
         self._status_broadcaster_task = None
         self.keep_alive = False
 
@@ -66,9 +67,9 @@ class VLCPlayer:
         """Retrieves a ClientSession object by its ID."""
         return self.active_clients.get(client_id)
 
-    async def start_hls_for_client(self, client_id: str) -> Optional[str]:
+    async def start_hls_for_client(self, client_id: str, track_id: str, start_position: int = 0) -> Optional[str]:
         """
-        Starts an HLS stream for a specific client based on the currently playing track.
+        Starts an HLS stream for a specific client.
         Returns the playlist URL if successful, None otherwise.
         """
         client_session = self.get_client_session(client_id)
@@ -80,18 +81,21 @@ class VLCPlayer:
             logger.warning(f"Client {client_id} is not an HLS_STREAMING client. Cannot start HLS.")
             return None
 
-        if not self.current_track_path:
-            logger.warning(f"No track currently playing for client {client_id} to start HLS stream.")
+        # Assuming track_id is the filepath
+        media_filepath = Path(track_id).resolve() 
+
+        if not media_filepath.is_file():
+            logger.error(f"Track ID '{track_id}' (filepath: {media_filepath}) not found for client {client_id}.")
             return None
 
         if client_session.hls_manager:
             logger.info(f"HLS stream already active for client {client_id}. Stopping existing stream.")
             await client_session.hls_manager.stop_stream()
 
-        logger.info(f"Starting HLS stream for client {client_id} from {self.current_track_path}")
-        hls_manager = HLSStreamManager(client_id, self.current_track_path, self.hls_http_port)
+        logger.info(f"Starting HLS stream for client {client_id} from {media_filepath} at position {start_position}s")
+        hls_manager = HLSStreamManager(client_id, media_filepath, self.hls_http_port)
         client_session.hls_manager = hls_manager
-        await hls_manager.start_stream()
+        await hls_manager.start_stream(start_position=start_position)
         
         if hls_manager.ffmpeg_process:
             playlist_url = hls_manager.get_playlist_url()
@@ -102,23 +106,51 @@ class VLCPlayer:
             client_session.hls_manager = None
             return None
 
-    async def stop_hls_for_client(self, client_id: str):
-        """Stops the HLS stream for a specific client."""
+    async def stop_hls_for_client(self, client_id: str) -> bool:
+        """Stops the HLS stream for a specific client. Returns True if successful."""
         client_session = self.get_client_session(client_id)
         if not client_session:
             logger.warning(f"Attempted to stop HLS for unknown client: {client_id}")
-            return
+            return False
         
         if client_session.client_type != ClientType.HLS_STREAMING:
             logger.warning(f"Client {client_id} is not an HLS_STREAMING client. No HLS stream to stop.")
-            return
+            return False
 
         if client_session.hls_manager:
             logger.info(f"Stopping HLS stream for client {client_id}.")
             await client_session.hls_manager.stop_stream()
             client_session.hls_manager = None
+            return True
         else:
             logger.info(f"No active HLS stream found for client {client_id}.")
+            return False
+
+    async def get_client_hls_url(self, client_id: str) -> Optional[str]:
+        """Returns the HLS playlist URL for a specific client if a stream is active."""
+        client_session = self.get_client_session(client_id)
+        if not client_session or not client_session.hls_manager or not client_session.hls_manager.ffmpeg_process:
+            return None
+        return client_session.hls_manager.get_playlist_url()
+
+    async def seek_hls_stream(self, client_id: str, seek_position: float) -> bool:
+        """Seeks the HLS stream for a specific client."""
+        client_session = self.get_client_session(client_id)
+        if not client_session or not client_session.hls_manager:
+            logger.warning(f"Attempted to seek HLS for unknown client or no active stream: {client_id}")
+            return False
+        
+        logger.info(f"Seeking HLS stream for client {client_id} to {seek_position}s.")
+        return await client_session.hls_manager.seek_stream(seek_position)
+
+    async def get_hls_stream_status(self, client_id: str) -> Optional[Dict[str, Any]]:
+        """Gets the detailed status of the HLS stream for a specific client."""
+        client_session = self.get_client_session(client_id)
+        if not client_session or not client_session.hls_manager:
+            return None
+        
+        status = await client_session.hls_manager.get_stream_status()
+        return status
 
     async def _run_sync(self, func, *args, **kwargs):
         """Runs a synchronous (blocking) function in a separate thread."""
@@ -408,8 +440,18 @@ class VLCPlayer:
                     tasks = []
                     for client_id, client_session in self.active_clients.items():
                         try:
+                            # Include HLS stream status if active for this client
+                            hls_stream_status = None
+                            if client_session.hls_manager and client_session.hls_manager.is_active:
+                                hls_stream_status = await client_session.hls_manager.get_stream_status()
+
                             # Ensure the message includes the client_id for context
-                            message = {"type": "status_update", "data": status, "recipient_client_id": client_id}
+                            message_data = {
+                                "server_status": status,
+                                "current_track": status.get("filepath"), # Simplified for now
+                                "hls_stream": hls_stream_status
+                            }
+                            message = {"type": MESSAGE_TYPE_STATUS_UPDATE, "data": message_data, "recipient_client_id": client_id}
                             tasks.append(self.send_message_to_client(client_id, message))
                         except Exception as e:
                             logger.warning(f"Error preparing status update for client {client_id}: {e}")
