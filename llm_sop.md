@@ -123,3 +123,10 @@
 
   Implement this plan now.
 ```
+
+## Notes
+
+**The testing problem**
+Everything worked well until tests generation in Phase 4. The first time the bots and I spent upwards of a few million tokens to make the tests work correctly. Total waste of effort.
+
+So I went back to the phase 3 commit and got it to write the tests all over again. This time it was able to sort out the kinks pretty easily.
